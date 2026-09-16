@@ -6,17 +6,17 @@
 # around the frontend build (vite) running out of memory.
 #
 # It handles everything discovered the hard way:
-#   1. Creates/repairs a 4 GB swap file (fixes "read swap header failed").
-#   2. Ensures the 'dispatcharr' user/group exist.
-#   3. Clones the repo.
-#   4. Runs the official installer's early steps (packages, postgres, python env)
-#      by invoking debian_install.sh — BUT patches its frontend build line first
-#      so vite gets a big Node heap. If the installer's build still OOMs (its
-#      git reset can revert the patch), we detect the missing build afterward and
-#      build the frontend manually with the flag inline.
-#   5. Ensures .env, data dirs, migrations, collectstatic.
-#   6. Writes systemd services + nginx and starts everything.
-#   7. Points you at the createsuperuser command (needs an interactive TTY).
+#  1. Creates/repairs a 4 GB swap file (fixes "read swap header failed").
+#  2. Ensures the 'dispatcharr' user/group exist.
+#  3. Clones the repo.
+#  4. Runs the official installer's early steps (packages, postgres, python env)
+#     by invoking debian_install.sh — BUT patches its frontend build line first
+#     so vite gets a big Node heap. If the installer's build still OOMs (its
+#     git reset can revert the patch), we detect the missing build afterward and
+#     build the frontend manually with the flag inline.
+#  5. Ensures .env, data dirs, migrations, collectstatic.
+#  6. Writes systemd services + nginx and starts everything.
+#  7. Points you at the createsuperuser command (needs an interactive TTY).
 #
 # Run as root on a fresh Debian install:
 #   chmod +x deploy_dispatcharr_full.sh && ./deploy_dispatcharr_full.sh
@@ -30,6 +30,14 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+# Some shells this script gets invoked from (su without '-', pct enter, a
+# stripped-down container entrypoint, etc.) hand us a PATH that's missing
+# /sbin and /usr/sbin, even though the binaries that live there (mkswap,
+# swapon, locale-gen, ...) are genuinely installed. Force them onto PATH
+# unconditionally so 'command -v' and the bare calls later in this script
+# actually find them.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
 # --- Tunables -----------------------------------------------------------------
 SWAP_SIZE_GB=4
 NODE_HEAP_MB=3072
@@ -40,9 +48,45 @@ POSTGRES_USER="dispatch"
 POSTGRES_PASSWORD="secret"
 HTTP_PORT=9191
 WS_PORT=8001
+LOCALE="en_US.UTF-8"   # locale to generate if none is active; change if you want another
 # ------------------------------------------------------------------------------
 
 log() { echo -e "\n>>> $*"; }
+die() { echo "[ERROR] $*" >&2; exit 1; }
+
+# Re-check that a command actually resolves, even when its package is
+# reportedly installed. On some images (containers, LXC 'pct enter' shells,
+# minimal cloud templates) PATH doesn't include every directory a package
+# installs into, so 'dpkg -l' can say a package is present while 'command -v'
+# still comes up empty. Walk through increasingly forceful fixes:
+#   1) is it just a PATH problem? -> find it with dpkg -L and symlink it
+#      into /usr/local/bin, which we've already forced onto PATH above.
+#   2) is the package itself missing/broken? -> (re)install it, then repeat
+#      the dpkg -L / symlink check.
+# Only if both of those fail do we give up and tell the user what to run by hand.
+require_cmd() {
+  local cmd="$1" pkg="$2" found=""
+
+  _link_if_found() {
+    found="$(dpkg -L "$pkg" 2>/dev/null | grep -E "/${cmd}\$" | head -n1)"
+    if [[ -n "$found" && -x "$found" ]]; then
+      ln -sf "$found" "/usr/local/bin/${cmd}"
+      hash -r
+    fi
+  }
+
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "  '$cmd' not on PATH yet — checking whether $pkg already provides it..."
+    _link_if_found
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "  Not found via $pkg yet — installing/reinstalling $pkg..."
+      apt install -y --reinstall "$pkg" || apt install -y "$pkg" || true
+      _link_if_found
+    fi
+    command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is still unavailable after installing '$pkg' and searching its file list. Run 'dpkg -S $cmd' (or 'dpkg -L $pkg | grep bin/') by hand to find it, then either add its directory to PATH or 'ln -s <path> /usr/local/bin/$cmd', and re-run this script."
+    echo "  '$cmd' resolved to $(command -v "$cmd")"
+  fi
+}
 
 ########################################
 # 0) System prep
@@ -50,7 +94,20 @@ log() { echo -e "\n>>> $*"; }
 log "[0/8] Updating system and installing prerequisites..."
 export DEBIAN_FRONTEND=noninteractive
 apt update && apt upgrade -y
-apt install -y git curl
+apt install -y git curl util-linux-extra locales
+
+log "Verifying swap/locale tooling is actually present..."
+require_cmd mkswap util-linux-extra
+require_cmd swapon util-linux-extra
+require_cmd locale-gen locales
+
+log "Ensuring a usable locale (${LOCALE}) is generated and active..."
+# Uncomment it in /etc/locale.gen if present, otherwise append it. Safe to
+# re-run: locale-gen skips locales that are already built.
+sed -i "s/^# *${LOCALE} UTF-8/${LOCALE} UTF-8/" /etc/locale.gen 2>/dev/null || true
+grep -q "^${LOCALE} UTF-8" /etc/locale.gen 2>/dev/null || echo "${LOCALE} UTF-8" >> /etc/locale.gen
+locale-gen || die "locale-gen failed — see the error above."
+update-locale LANG="${LOCALE}" 2>/dev/null || true
 
 ########################################
 # 1) Swap
@@ -64,8 +121,8 @@ else
   fallocate -l "${SWAP_SIZE_GB}G" /swapfile 2>/dev/null || \
     dd if=/dev/zero of=/swapfile bs=1M count=$((SWAP_SIZE_GB * 1024))
   chmod 600 /swapfile
-  mkswap /swapfile
-  swapon /swapfile
+  mkswap /swapfile || die "mkswap failed — see the error above."
+  swapon /swapfile || die "swapon failed — see the error above."
   grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
   echo "Swap enabled."
 fi
@@ -299,6 +356,7 @@ cat > /etc/nginx/sites-available/dispatcharr.conf <<'EOF'
 server {
     listen 9191;
     client_max_body_size 0;
+
     location / {
         include uwsgi_params;
         uwsgi_param HTTP_X_REAL_IP $remote_addr;
@@ -306,9 +364,11 @@ server {
         uwsgi_send_timeout 600;
         uwsgi_pass unix:/run/dispatcharr/dispatcharr.sock;
     }
+
     location /static/ { alias /opt/dispatcharr/static/; }
     location /assets/ { alias /opt/dispatcharr/frontend/dist/assets/; }
     location /media/  { alias /opt/dispatcharr/media/; }
+
     location /ws/ {
         proxy_pass http://127.0.0.1:8001;
         proxy_http_version 1.1;
@@ -333,6 +393,7 @@ systemctl enable --now dispatcharr dispatcharr-celery dispatcharr-celerybeat dis
 # 8) Summary + admin instructions
 ########################################
 server_ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
+
 log "[8/8] Done. Service status:"
 systemctl is-active dispatcharr dispatcharr-celery dispatcharr-celerybeat dispatcharr-daphne nginx | \
   paste -d' ' <(printf 'dispatcharr\ncelery\ncelerybeat\ndaphne\nnginx\n') -
@@ -342,7 +403,7 @@ cat <<EOF
 ==================================================================
  Dispatcharr is installed and running.
 
- URL:  http://${server_ip}:${HTTP_PORT}
+ URL: http://${server_ip}:${HTTP_PORT}
 
  CREATE YOUR ADMIN ACCOUNT (needs an interactive prompt, so it is
  NOT done automatically). Run these lines now:
